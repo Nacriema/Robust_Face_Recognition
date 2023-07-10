@@ -1,5 +1,9 @@
 # Robust_Face_Recognition
 
+## Runing Code
+
+1. Install the required packages, I'll write the requirements later
+2. Run command: `python main.py -i test_images/sample_1.png`
 
 ## Experimental Results
 
