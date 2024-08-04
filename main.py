@@ -7,6 +7,8 @@ from scipy import ndimage
 
 from matplotlib.image import imsave
 from scipy.linalg import lstsq
+from scipy.sparse import diags, linalg
+from skimage import exposure
 
 from argparse import ArgumentParser
 
@@ -408,18 +410,19 @@ def generate_shadow_specific_edge(gray_invariance_img, gray_light_img, tao_min=0
 
 # Implement trigger from log-RGB to RGB conversion
 
-def rgb2logrgb(rgb_image):
+def log_transform(rgb_image):
     """
     Function to convert image in form RGB to log-RGB
     """
-    log_rgb = np.log(rgb_image)  # This is actually I want !!!
+    print(f'RGB IMAGE: {rgb_image.dtype}')
+    log_rgb = np.log1p(rgb_image)  # This is actually I want !!!
     return log_rgb
 
-def logrgb2rgb(log_rgb_image):
+def inverse_log_transform(log_rgb_image):
     """
     Function to convert back the image from log-RGB to RGB image
     """
-    img_origin = np.array(np.exp(log_rgb_image), dtype=np.uint8)
+    img_origin = np.array(np.expm1(log_rgb_image), dtype=np.uint8)
     return img_origin
 
 
@@ -456,62 +459,81 @@ def generate_v_i(log_image, invert_edge_map):
     v_i = sigma_grad_x + sigma_grad_y
     return v_i
 
-def generate_v(image_rgb, edge_map):
-    """
-    Generate the v for each color channel
-    
-    NOTE: Reuse cal_image_gradients to calculate the image gradient along the x and y axis
-    
-    """
-    log_image = rgb2logrgb(image_rgb)
-    log_r, log_g, log_b = log_image[:, :, 0], log_image[:, :, 1], log_image[:, :, 2]
-    invert_edge_map = 1*np.invert(edge_map)
-    v = []
-    for log_image in [log_r, log_g, log_b]:
-        v.append(generate_v_i(log_image=log_image.astype(np.float32), invert_edge_map=invert_edge_map))
-    return v
-
 def normalize_log(grayscale_log_image):
     grayscale_log_image -= np.min(grayscale_log_image)
     grayscale_log_image *= 1 / np.max(grayscale_log_image) * np.log(255)
     print(f'UNIQUE VALUE: {np.unique(grayscale_log_image)}')
     return grayscale_log_image
 
+def compute_shadow_free_gradient(L, M):
+    """
+    Compute shadow-free gradient map ζ for each channel.
+    """
+    gradients = np.gradient(L)
+    grad_x, grad_y = gradients[0], gradients[1]
+    
+    # Initialize shadow-free gradient map
+    ζx = np.where(M == 0, grad_x, 0)
+    ζy = np.where(M == 0, grad_y, 0)
+    
+    return ζx, ζy
+
+def solve_poisson(L, ν):
+    """
+    Solve Poisson's equation L * Lb = ν.
+    """
+    Lb = linalg.spsolve(L, ν.flatten())
+    return Lb.reshape(ν.shape)
+
+def compute_laplacian(ζx, ζy):
+    """
+    Compute the Laplacian ν using the shadow-free gradients.
+    """
+    grad_x, grad_y = np.gradient(ζx), np.gradient(ζy)
+    ν = grad_x[0] + grad_y[1]
+    
+    return ν
+
+def construct_laplacian_matrix(M, N):
+    """
+    Construct the sparse matrix Λ for Poisson's equation.
+    """
+
+    main_diag = -4 * np.ones(M * N)
+    side_diag = np.ones(M * N - 1)
+    side_diag[np.arange(1, M * N) % N == 0] = 0  # Remove diagonals for boundary conditions
+
+    diagonals = [main_diag, side_diag, side_diag, side_diag, side_diag]
+    offsets = [0, -1, 1, -N, N]
+    
+    L = diags(diagonals, offsets, shape=(M * N, M * N), format='csc')    
+    return L
 
 def generate_recovery_image(image_rgb, edge_map):
-    height, width, channel = image_rgb.shape
-    print(f'Image height: {height}, image width: {width}')
-    
-    # Based on the height witdh of the image, generate the laplace matrix
-    diagonal_elem = generate_laplace_matrix(size=height)
-    print(f'Diagonal element shape: {diagonal_elem.shape}')
-    laplace_matrix = generate_laplace_matrix(size=width, diagonal_elem=diagonal_elem, near_elem=np.eye(height))
-    print(f'Laplace matrix shape: {laplace_matrix.shape}')
-    
-    # Generate v_i for RGB channel
-    v = generate_v(image_rgb=image_rgb, edge_map=edge_map)
-    L = []
-    print(f'LAPLACIAN MATRIX SHAPE: {laplace_matrix.shape}')
-    for v_i in v:
-        print(f'CURRENT V_I SHAPE: {v_i.shape}')
-        L_i_hat = np.linalg.solve(laplace_matrix, v_i.flatten())   # (19182, 19182) and (19182, ) shape
-        print('DONE WITH ONE ...')
-        L_i_hat = np.reshape(L_i_hat, (height, width))
-        print(f'L_i_hat shape: {L_i_hat.shape}')
-        
-        L_i_hat_norm = normalize_log(grayscale_log_image=L_i_hat)
-        
-        plt.title(f'FREE LOG IMAGE')
-        plt.imshow(L_i_hat_norm, cmap='gray')
-        plt.show()
-        L.append(L_i_hat_norm)
-    
-    assert len(L) == 3
-    log_image = cv2.merge(L)
-    rgb_image = logrgb2rgb(log_rgb_image=log_image)
-    
-    return rgb_image
+    """ 
+        This is a better version in time processing
+    """
+    height, width, _ = image_rgb.shape
+    # Construct Laplacian matrix
+    laplacian_matrix = construct_laplacian_matrix(height, width)
 
+    L = []
+    for channel in cv2.split(image_rgb):
+        # Apply log transformation
+        L_channel = log_transform(channel)
+        # Compute shadow-free gradients
+        ζx, ζy = compute_shadow_free_gradient(L_channel, edge_map)
+        # Compute Laplacian
+        ν = compute_laplacian(ζx, ζy)
+        # Solve Poisson's equation
+        Lb = solve_poisson(laplacian_matrix, ν)
+        # Historgram matching from Lb to L
+        Lb = exposure.match_histograms(Lb, L_channel)
+        # Exponentiate and adjust intensity
+        Lb_exp = inverse_log_transform(Lb)
+        L.append(Lb_exp)
+    reconstructed_img = cv2.merge(L)
+    return reconstructed_img
 
 if __name__ == '__main__':
     parser = ArgumentParser()
@@ -609,10 +631,9 @@ if __name__ == '__main__':
     three_d_vector_representation(grays, X, min_idx, cos_sin_theta_min, w, h)
     
     edge_map = generate_shadow_specific_edge(gray_invariance_img=grays[:, :, min_idx],
-                                  gray_light_img=grays[:, :, max_idx])
+                                  gray_light_img=grays[:, :, max_idx], tao_min=0.035, tao_max=0.06)
 
-    # v = generate_v(image_rgb=img[:, :, ::-1], edge_map=edge_map)
-    recovery_image = generate_recovery_image(image_rgb=img[:, :, ::-1], edge_map=edge_map)
+    recovery_image = generate_recovery_image(image_rgb=img[:, :, ::-1].astype(float), edge_map=edge_map)
     plt.title('Free Log Image')
     
     plt.imshow(recovery_image)
